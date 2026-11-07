@@ -64,7 +64,7 @@ func confirm(in io.Reader, out io.Writer, interactive, yes bool) error {
 }
 func run(ctx context.Context, args []string, in io.Reader, out io.Writer, interactive bool) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		fmt.Fprintln(out, "用法: scfproxy <gen-token|deploy|list|delete|check|bench> [参数]\n使用 scfproxy <子命令> -h 查看帮助。部署前请先 make package-server。")
+		fmt.Fprintln(out, "用法: scfproxy <gen-token|deploy|list|delete|check|bench|pool> [参数]\n使用 scfproxy <子命令> -h 查看帮助。部署前请先 make package-server。")
 		return nil
 	}
 	var err error
@@ -80,6 +80,8 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer, intera
 				fmt.Fprintln(out, hex.EncodeToString(token[:]))
 			}
 		}
+	case "pool":
+		err = poolCommand(ctx, args[1:], in, out, interactive)
 	case "deploy", "list", "delete":
 		err = manage(ctx, args[0], args[1:], in, out, interactive)
 	case "check", "bench":
@@ -126,19 +128,22 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 	var path string
 	var yes bool
 	waitTimeout := 3 * time.Minute
+	eipTimeout := 3 * time.Minute
 	if command != "list" {
 		fs.BoolVar(&yes, "yes", false, "明确确认执行，无需交互")
 		fs.StringVar(&path, "o", "endpoints.txt", "合并或清理的endpoints文件")
 	}
 	packagePath := ""
 	if command == "deploy" {
+		fs.BoolVar(&o.FixedIP, "fixed-ip", false, "开启固定公网出口IP（同账号同地域共享）")
+		fs.DurationVar(&eipTimeout, "eip-timeout", 3*time.Minute, "等待固定公网IP出现的总超时")
 		fs.BoolVar(&o.UpdateCode, "update-code", false, "更新已有且属于scfproxy的函数代码，不修改配置或token")
 		fs.IntVar(&o.Count, "n", 1, "每地域函数数量")
 		fs.StringVar(&packagePath, "package", "dist/scf-server.zip", "make package-server生成的zip")
 		fs.StringVar(&o.Runtime, "runtime", "Go1", "运行时，实测可改CustomRuntime")
 		fs.Int64Var(&o.Timeout, "timeout", 900, "执行超时秒数，必须>=idle-timeout")
 		fs.Int64Var(&o.IdleTimeout, "idle-timeout", 600, "WS空闲超时秒数，范围需上云确认")
-		fs.Int64Var(&o.Memory, "memory", 128, "内存MB")
+		fs.Int64Var(&o.Memory, "memory", 64, "内存MB")
 		fs.IntVar(&o.Concurrency, "concurrency", 8, "最多并发创建数量")
 		fs.DurationVar(&waitTimeout, "wait-timeout", 3*time.Minute, "每个函数等待Active的总超时")
 	}
@@ -155,8 +160,8 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 	o.Regions = resolved
 	o.Prefix = *prefix
 	if command == "deploy" {
-		if waitTimeout <= 0 {
-			return errors.New("wait-timeout必须大于0")
+		if waitTimeout <= 0 || eipTimeout <= 0 {
+			return errors.New("wait-timeout和eip-timeout必须大于0")
 		}
 		o.Token = os.Getenv("SCFPROXY_TOKEN")
 		if o.Token == "" {
@@ -171,6 +176,12 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 			return err
 		}
 		fmt.Fprintf(out, "部署计划: runtime=%s timeout=%ds idle-timeout=%ds memory=%dMB update-code=%v 共%d个函数\n", o.Runtime, o.Timeout, o.IdleTimeout, o.Memory, o.UpdateCode, len(plan))
+		if o.FixedIP {
+			fmt.Fprintln(out, "固定出口IP已开启；固定IP网关可能产生额外费用。 ")
+			if o.Count > 1 {
+				fmt.Fprintln(out, "警告：同账号同地域内的函数共享同一EIP；-n > 1 不会获得不同出口IP。 ")
+			}
+		}
 		for _, e := range plan {
 			fmt.Fprintf(out, "  %s %s\n", e.Region, e.Function)
 		}
@@ -182,7 +193,7 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 	if err != nil {
 		return err
 	}
-	manager := &deploy.Manager{Factory: factory, WaitTimeout: waitTimeout}
+	manager := &deploy.Manager{Factory: factory, WaitTimeout: waitTimeout, EgressIPTimeout: eipTimeout}
 	if command == "deploy" {
 		results, err := manager.Deploy(ctx, o)
 		if err != nil {
@@ -200,7 +211,7 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 				failed++
 				fmt.Fprintf(out, "失败 %s %s: %v\n", r.Region, r.Function, deploy.SafeError(r.Err))
 			} else {
-				fmt.Fprintf(out, "成功 %s %s %s\n", r.Region, r.Function, r.URL)
+				fmt.Fprintf(out, "成功 %s %s %s 出口IP=%s\n", r.Region, r.Function, r.URL, r.EgressIP)
 				endpoints = append(endpoints, r.Endpoint)
 			}
 		}
@@ -220,7 +231,7 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 		return err
 	}
 	for _, item := range items {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.Region, item.Function, item.Status, item.URL)
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t出口IP=%s\n", item.Region, item.Function, item.Status, item.URL, item.EgressIP)
 		if item.URLWarning != nil {
 			fmt.Fprintf(out, "  URL获取提示: %v\n", deploy.SafeError(item.URLWarning))
 		}

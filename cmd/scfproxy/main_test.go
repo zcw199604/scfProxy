@@ -3,9 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestFunctionMemoryDefaultsTo64MB(t *testing.T) {
+	for _, args := range [][]string{{"deploy", "-h"}, {"pool", "init", "-h"}, {"pool", "replenish", "-h"}, {"pool", "rotate", "-h"}} {
+		var out bytes.Buffer
+		if err := run(context.Background(), args, strings.NewReader(""), &out, false); err != nil {
+			t.Fatal(err)
+		}
+		if !regexp.MustCompile(`-memory int\n[^\n]*\(default 64\)`).MatchString(out.String()) {
+			t.Errorf("%v 的memory默认值不是64MB: %s", args, out.String())
+		}
+	}
+}
 
 func TestHelpDoesNotReadCredentialsOrCallCloud(t *testing.T) {
 	for _, args := range [][]string{{"-h"}, {"deploy", "-h"}, {"list", "-h"}, {"delete", "-h"}, {"check", "-h"}, {"bench", "-h"}, {"gen-token", "-h"}} {

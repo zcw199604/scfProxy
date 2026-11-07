@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 type Options struct {
 	UpdateCode                   bool
+	FixedIP                      bool
 	Regions                      []string
 	Count                        int
 	Prefix, Runtime, Token       string
@@ -28,6 +30,7 @@ type Options struct {
 type Result struct {
 	Endpoint
 	Status, Description string
+	EgressIP            string
 	Existed             bool
 	Updated             bool
 	Err                 error
@@ -37,6 +40,7 @@ type Result struct {
 // Manager 的时间参数可调整；Factory 不会在计划阶段调用。
 type Manager struct {
 	Factory                                      Factory
+	EgressIPTimeout                              time.Duration
 	PollInterval, WaitTimeout, TriggerRetryDelay time.Duration
 }
 
@@ -101,6 +105,23 @@ func (m *Manager) Deploy(ctx context.Context, o Options) ([]Result, error) {
 	wg.Wait()
 	return results, nil
 }
+
+// Create 使用明确函数名创建一个函数；供固定 IP 池生成不冲突的名称。
+func (m *Manager) Create(ctx context.Context, o Options, e Endpoint) Result {
+	check := o
+	check.Regions = []string{e.Region}
+	check.Count = 1
+	if _, err := Plan(check); err != nil {
+		return Result{Endpoint: e, Err: err}
+	}
+	if !validFunctionName(e.Function) || !strings.HasPrefix(e.Function, o.Prefix+"-") {
+		return Result{Endpoint: e, Err: errors.New("函数名无效或不属于指定prefix")}
+	}
+	if o.Token == "" || len(o.Package) == 0 {
+		return Result{Endpoint: e, Err: errors.New("token及代码包不能为空")}
+	}
+	return m.deployOne(ctx, o, e)
+}
 func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 	result := Result{Endpoint: e, Description: "scfproxy"}
 	api, err := m.Factory(e.Region)
@@ -124,6 +145,9 @@ func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 	r.Tags = []*scf.Tag{{Key: ref("managed-by"), Value: ref("scfproxy")}}
 	r.AutoDeployClsTopicIndex = ref("FALSE")
 	r.AutoCreateClsTopic = ref("FALSE")
+	if o.FixedIP {
+		r.PublicNetConfig = &scf.PublicNetConfigIn{PublicNetStatus: ref("ENABLE"), EipConfig: &scf.EipConfigIn{EipStatus: ref("ENABLE")}}
+	}
 	_, err = api.CreateFunctionWithContext(ctx, r)
 	if err != nil {
 		if code := ErrorCode(err); code == "ResourceInUse.Function" || code == "ResourceInUse.FunctionName" || code == "ResourceInUse.FunctionAlreadyExists" {
@@ -165,7 +189,66 @@ func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 	}
 	result.Status = "Active"
 	result.URL, result.Err = m.functionURL(ctx, api, e.Function, !result.Updated)
+	if result.Err == nil && o.FixedIP {
+		result.EgressIP, result.Err = m.WaitEgressIP(ctx, e.Region, e.Function)
+	}
 	return result
+}
+
+// egressIP 优先读取新公网配置，兼容旧响应字段；忽略尚未分配的空值。
+func egressIP(f *scf.GetFunctionResponseParams) string {
+	if f == nil {
+		return ""
+	}
+	var candidates []*string
+	if f.PublicNetConfig != nil && f.PublicNetConfig.EipConfig != nil {
+		candidates = append(candidates, f.PublicNetConfig.EipConfig.EipAddress...)
+	}
+	if f.EipConfig != nil {
+		candidates = append(candidates, f.EipConfig.Eips...)
+	}
+	for _, p := range candidates {
+		if ip, err := netip.ParseAddr(value(p)); err == nil {
+			return ip.Unmap().String()
+		}
+	}
+	return ""
+}
+
+// WaitEgressIP 在固定 IP 分配完成前轮询，默认总预算三分钟。
+func (m *Manager) WaitEgressIP(ctx context.Context, region, function string) (string, error) {
+	timeout := m.EgressIPTimeout
+	if timeout <= 0 {
+		timeout = 3 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	api, err := m.Factory(region)
+	if err != nil {
+		return "", err
+	}
+	interval := m.PollInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	for {
+		r := scf.NewGetFunctionRequest()
+		r.Namespace = ref("default")
+		r.FunctionName = ref(function)
+		resp, err := api.GetFunctionWithContext(ctx, r)
+		if err != nil {
+			return "", err
+		}
+		if resp == nil || resp.Response == nil {
+			return "", errors.New("GetFunction 返回空响应")
+		}
+		if ip := egressIP(resp.Response); ip != "" {
+			return ip, nil
+		}
+		if err = wait(ctx, interval); err != nil {
+			return "", fmt.Errorf("等待固定出口IP超时或取消: %w", err)
+		}
+	}
 }
 func wait(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
@@ -374,6 +457,15 @@ func (m *Manager) List(ctx context.Context, regions []string, prefix string) ([]
 				}
 				item := Result{Endpoint: Endpoint{Region: region, Function: value(f.FunctionName)}, Description: value(f.Description), Status: value(f.Status)}
 				item.URL, item.URLWarning = m.functionURL(ctx, api, item.Function, false)
+				get := scf.NewGetFunctionRequest()
+				get.FunctionName = ref(item.Function)
+				get.Namespace = ref("default")
+				detail, getErr := api.GetFunctionWithContext(ctx, get)
+				if getErr != nil {
+					item.URLWarning = errors.Join(item.URLWarning, fmt.Errorf("读取固定出口IP: %w", getErr))
+				} else if detail != nil {
+					item.EgressIP = egressIP(detail.Response)
+				}
 				results = append(results, item)
 			}
 			offset += int64(len(page.Functions))
@@ -408,6 +500,10 @@ func (m *Manager) Delete(ctx context.Context, items []Result, prefix string) []R
 		get.Namespace = ref("default")
 		current, err := api.GetFunctionWithContext(ctx, get)
 		if err != nil {
+			if absentFunction(err) {
+				item.Err = nil
+				continue
+			}
 			item.Err = err
 			continue
 		}
@@ -448,7 +544,19 @@ func (m *Manager) Delete(ctx context.Context, items []Result, prefix string) []R
 			}
 			_, err = api.DeleteFunctionWithContext(ctx, r)
 		}
+		if absentFunction(err) {
+			err = nil
+		}
 		item.Err = err
 	}
 	return out
+}
+
+func absentFunction(err error) bool {
+	switch ErrorCode(err) {
+	case "ResourceNotFound.Function", "ResourceNotFound.FunctionName":
+		return true
+	default:
+		return false
+	}
 }

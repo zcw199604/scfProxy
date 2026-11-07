@@ -28,10 +28,15 @@ type Strategy int
 const (
 	Random Strategy = iota
 	StickyByHost
+	Pinned
 )
 
 // Config 配置隧道。负值 PingInterval 关闭保活；DisableRateLimit 关闭默认上行限速。
 type Config struct {
+	PoolFile             string
+	BanTTL               time.Duration
+	ReloadInterval       time.Duration
+	OnSwitch             func(old, new EndpointInfo, reason string)
 	Endpoints            []string
 	EndpointsFile        string
 	Token                string
@@ -73,6 +78,7 @@ type warmConn struct {
 	idleDone chan struct{}
 }
 type Proxy struct {
+	pinned    *pinnedState
 	cfg       Config
 	endpoints []string
 	mu        sync.Mutex
@@ -87,6 +93,9 @@ type Proxy struct {
 }
 
 func New(cfg Config) (*Proxy, error) {
+	if cfg.PoolFile != "" {
+		return newPinnedProxy(cfg)
+	}
 	if cfg.Token == "" {
 		return nil, errors.New("scfproxy: Token 不能为空")
 	}
@@ -119,7 +128,10 @@ func New(cfg Config) (*Proxy, error) {
 	if len(endpoints) == 0 {
 		return nil, errors.New("scfproxy: 至少需要一个 endpoint")
 	}
-	if cfg.Strategy != Random && cfg.Strategy != StickyByHost {
+	if cfg.Strategy == Pinned && len(endpoints) != 1 {
+		return nil, errors.New("scfproxy: Pinned 必须只有一个 endpoint 或使用 PoolFile")
+	}
+	if cfg.Strategy != Random && cfg.Strategy != StickyByHost && cfg.Strategy != Pinned {
 		return nil, errors.New("scfproxy: 无效策略")
 	}
 	if cfg.DialTimeout == 0 {
@@ -194,6 +206,10 @@ func (p *Proxy) bypass(host string) bool {
 	return false
 }
 func (p *Proxy) order(host string) []int {
+	if p.cfg.Strategy == Pinned {
+		order := make([]int, p.cfg.MaxRetries+1)
+		return order
+	}
 	start := rand.IntN(len(p.endpoints))
 	if p.cfg.Strategy == StickyByHost {
 		h := fnv.New32a()
@@ -299,6 +315,9 @@ func (p *Proxy) signal() {
 }
 
 func (p *Proxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if p.pinned != nil {
+		return p.dialPinned(ctx, network, addr)
+	}
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return nil, fmt.Errorf("scfproxy: 不支持网络 %q", network)
 	}
@@ -422,6 +441,9 @@ endpoints:
 	return nil, last
 }
 func (p *Proxy) failed(i int) {
+	if p.cfg.Strategy == Pinned {
+		return
+	}
 	p.mu.Lock()
 	p.cooldown[i] = time.Now().Add(p.cfg.EndpointCooldown)
 	p.mu.Unlock()
@@ -436,6 +458,9 @@ func (p *Proxy) Transport() *http.Transport {
 	return t
 }
 func (p *Proxy) Close() error {
+	if p.pinned != nil {
+		return p.closePinned()
+	}
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -500,7 +525,7 @@ func (p *Proxy) maintainPool() {
 			i := next % len(p.endpoints)
 			next++
 			p.mu.Lock()
-			healthy := !time.Now().Before(p.cooldown[i])
+			healthy := p.cfg.Strategy == Pinned || !time.Now().Before(p.cooldown[i])
 			p.mu.Unlock()
 			if healthy {
 				ctx, cancel := context.WithTimeout(p.ctx, p.cfg.DialTimeout)

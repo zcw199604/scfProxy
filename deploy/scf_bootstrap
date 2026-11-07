@@ -1,2 +1,3 @@
 #!/bin/bash
+export GOMEMLIMIT=${GOMEMLIMIT:-40MiB}
 exec ./scf-server

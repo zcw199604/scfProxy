@@ -178,11 +178,15 @@ export SCFPROXY_TOKEN="$(./dist/scfproxy gen-token)"
 | `--update-code` | false；更新已有且名称前缀、Description 均匹配的函数代码 |
 | `--timeout` | 900 秒；必须不小于 idle-timeout |
 | `--idle-timeout` | 600 秒；必须为正数，实际平台范围待确认 |
-| `--memory` | 128 MB；实际可用规格由平台校验 |
+| `--memory` | 64 MB；实际可用规格由平台校验，WS Web 函数创建与运行待下次上云确认 |
 | `--concurrency` | 8；最多同时进行的函数创建流程 |
 | `--wait-timeout` | 3 分钟；每个函数等待 Active 的总超时 |
 | `-o` | endpoints.txt；成功地址合并去重，附加地域/函数名注释，权限 0644 |
 | `--yes` | 跳过交互确认；非交互环境必须显式提供 |
+
+`deploy --memory`、pool 创建类子命令的 `--memory` 及 `scfpool.Options.Memory` 的零值默认均为 64MB。本地实测经隧道不限速下载 100MB + 上传 20MB，scf-server 最大常驻内存为 17.4MB；函数端不做 TLS，单实例单连接，缓冲区固定，内存不随传输量增长。64MB 资源费约为 128MB 的一半；64MB 在 WS Web 函数上的创建与运行待下次上云确认。
+
+`scf_bootstrap` 启动前默认设置 `GOMEMLIMIT=40MiB`，为 Go 运行时设置软内存上限，给进程其他内存及平台开销留出余量；可通过同名环境变量覆盖。它不等同于进程常驻内存的硬限制。打包保留启动脚本的可执行权限。
 
 创建请求采用 `Namespace=default`、`Type=HTTP`、`ProtocolType=WS`、Description 为 `scfproxy` 和 `managed-by=scfproxy` 标签，关闭自动创建 CLS 主题和索引。等待状态 Active 后获取或创建 `func_url` HTTP 触发器，关闭平台 URL 认证、打开公网访问；隧道内仍必须通过 HMAC 认证。创建触发器遇到 FailedOperation 每隔 5 秒重试，最多 10 次。识别函数 URL 时不依赖 TriggerName（平台可能改写为 URL ID），选择带有效外网地址的 HTTP 触发器，多个时优先 `$LATEST`。优先读取 `WssExtranetUrl`，为空才将 `ExtranetUrl` 的 https/http 转为 wss/ws，保留路径和查询参数。
 
@@ -243,3 +247,135 @@ list 分页查询并且只展示名称以 `<prefix>-` 开头、Description **精
 - 函数最长执行时间断开、其他地域的冷启动与连接表现，以及海外目标失败的具体 DNS/网络原因。
 
 本次固定 SDK 模块为 common `v1.3.210`、scf `v1.3.101`（实现时模块代理返回的最新稳定版本）。`CreateTrigger.Response.TriggerInfo` 的 SDK 类型为 `Trigger`，`ListTriggers.Response.Triggers` 为 `TriggerInfo` 列表，分别读取其 `TriggerDesc`；其余要求的创建字段均可直接设置。
+
+## 固定出口 IP 池
+
+默认非固定 IP 模式下，用户实测连续 6 次连接得到 6 个不同出口 IP。固定 IP 模式通过 SCF 的公网 EIP 配置创建出口：同一账号、同一地域的所有固定 IP 函数共享同一 EIP，因此主备必须分布在不同地域。地域所有固定 IP 函数均关闭或删除后再次创建，才可能重新分配 EIP；平台释放需要时间，无法保证立即得到新地址。平台信息为每地域每账号最多 5 个固定 IP，固定 IP 网关带宽上限 100Mbps，具体费用及配额请以上云结果为准。
+
+独立函数也可开启固定出口：
+
+```bash
+./dist/scfproxy deploy -r ap-singapore --fixed-ip --eip-timeout 3m --yes
+./dist/scfproxy list -r ap-singapore
+```
+
+`--fixed-ip` 创建时设置 `PublicNetStatus=ENABLE`、`EipStatus=ENABLE`，等待函数 Active 和 URL 后轮询 EIP，`--eip-timeout` 默认 3 分钟。优先读 `PublicNetConfig.EipConfig.EipAddress`，兼容旧字段 `EipConfig.Eips`；list 增加出口 IP 列。同地域 `-n > 1` 会警告共享 EIP。既有函数的 `--update-code` 仍只更新代码，不会开启固定 IP 或更改网络配置。
+
+池文件 `pool.json` 是主备顺序、退役记录和临时封禁 IP 的唯一事实来源，不含凭证或 token。`active[0]` 为主用，其余为备用；`retired` 是待删除函数；`banned_ips` 仅在有效期内阻止 IP 再入池；`region_last_used` 记录地域使用时间。不要手工复制一个函数到多个地域记录或复用同一 IP。
+
+`banned_ips` 现在使用对象数组（时间为 RFC3339），例如：
+
+```json
+[
+  {"ip":"1.2.3.4","banned_at":"2026-11-07T10:00:00Z","expires_at":"2026-11-08T10:00:00Z","reason":"目标拒绝此IP"}
+]
+```
+
+封禁默认有效期为 24h。`scfproxy.Config.BanTTL` 控制 PoolFile 模式下 `p.Switch` 的有效期；`scfpool.Options.BanTTL` 控制 `mgr.Switch`，本地 `scfpool.Switch(path, reason, ttl)` 也可指定有效期。零值使用默认 24h，负数表示切换时不记录封禁。同一 IP 再次被封时更新时间和原因，过期时间取更晚者，不重复追加。补位只检查未过期记录，每次成功的池文件事务写入都会清理过期记录；status 显示未过期封禁的剩余时间。解除封禁仅允许该 IP 再次参与补位，不恢复已退役函数或切换当前主用。
+
+读取兼容旧的字符串数组：旧条目的 `banned_at` 视为本次读取时刻，`expires_at` 为其后 24h，下次成功写入时转换为对象格式；读取不修改文件，因此转换落盘前再次读取会重新计算旧条目的有效期。
+
+```bash
+# 需先设置腾讯云凭证、SCFPROXY_TOKEN，并 make package-server build-cli
+./dist/scfproxy pool init --regions ap-singapore,ap-tokyo,ap-seoul --size 2 --yes
+./dist/scfproxy pool status
+
+# 只切主备并将旧主退役/加入banned_ips，不调用云接口
+./dist/scfproxy pool switch --reason '目标拒绝此IP' --ban-ttl 6h
+
+# 删除退役函数并补充备用
+./dist/scfproxy pool replenish --regions ap-singapore,ap-tokyo,ap-seoul --size 2 --yes
+# 或一次执行switch + replenish
+./dist/scfproxy pool rotate --regions ap-singapore,ap-tokyo,ap-seoul --reason '目标拒绝此IP' --ban-ttl 30m --yes
+
+# 手动解除本地封禁，无需云凭证或--yes
+./dist/scfproxy pool unban --ip 1.2.3.4
+./dist/scfproxy pool unban --all
+
+# 删除池中active和retired，保留已封IP
+./dist/scfproxy pool destroy --yes
+```
+
+所有命令支持 `--pool`（默认 `pool.json`）；创建/删除命令需要交互输入 yes 或 `--yes`。status、switch 和 unban 不需要云凭证。创建类命令另支持 `--prefix`、`--package`、`--runtime`、`--timeout`、`--idle-timeout`、`--memory`、`--eip-timeout` 和 `--max-attempts`。主备必须使用同一个 token。补充以文件中的 active 数量为准，不会缩减超出 `--size` 的池。
+
+补充会先删除 retired（删除前校验名称前缀及 Description=scfproxy，函数已不存在视为删除成功），再从未被 active 或未删除 retired 占用的候选地域补位。优先较久未使用的地域，刚删除的地域放到后面；候选地域多于池大小有助于避开 EIP 释放延迟。新 EIP 若已封禁或与在用 IP 重复，则删除该新函数并重试，单个补位默认最多 3 次。失败保留可恢复的文件状态；新建和删除报告包含地域、函数、IP 及耗时。云接口或进程异常后，请先 status 检查，再 replenish 恢复，不要直接删除池文件以免遗失云资源记录。
+
+### 在业务中固定主用
+
+```go
+p, err := scfproxy.New(scfproxy.Config{
+    PoolFile: "pool.json", // 与Endpoints及EndpointsFile互斥，自动采用Pinned
+    Token: os.Getenv("SCFPROXY_TOKEN"),
+    ReloadInterval: 2 * time.Second,
+    BanTTL: 24 * time.Hour, // 默认24h；负数表示Switch不记录封禁
+    OnSwitch: func(old, next scfproxy.EndpointInfo, reason string) {
+        log.Printf("出口由 %s 切换至 %s，原因 %s", old.EgressIP, next.EgressIP, reason)
+    },
+})
+if err != nil { return err }
+defer p.Close()
+// 使用p.DialContext或p.Transport，接入方式与普通模式相同。
+current := p.Active()
+_ = current
+// 仅在业务明确判断出口应退役时主动调用；临时网络故障不应触发切换。
+old, next, err := p.Switch("业务确认IP已封")
+_, _, _ = old, next, err
+```
+
+Pinned **绝不因失败自动转移到备用**。所有拨号和预热只走主用；`MaxRetries` 仅在相同 endpoint 重试，不受冷却影响，Bypass 仍可直连。显式 Switch 无备用时返回 `ErrNoStandby`，文件和内存保持不变。Switch 成功后旧主加入 retired 和 banned_ips，关闭旧主上已建立的隧道、预热和在途连接，使 HTTP 长连接及 WS 客户端重连后使用新出口。调用方仍需处理连接断开并重建请求，库不会重放业务流量。
+
+热加载默认每 2 秒检查池文件；主用未变时不打断连接，外部 `pool switch`/`rotate` 改变主用时走同样的关闭与切换流程，回调 reason 为 `external`。`OnSwitch` 异步调用，不阻塞 Switch；回调可能与其他切换回调并发，业务需自行管理回调生命周期。空池不允许新建固定模式 Proxy；运行中外部清空池后将关闭旧主，停止新拨号。
+
+若拨号期间显式 Switch 或热加载已经更换主用，库会关闭旧连接，并使用最新主用额外重试一次；仍失败则返回错误。主用未变时，拨号失败不会触发备用切换。
+
+### 固定 IP 池实测结果（2026-11-07）
+
+以下为用户在真实腾讯云上的实测反馈：
+
+- 未开启固定 IP 时，连续 6 次连接得到 6 个不同出口 IP；开启后，主用 5 次请求出口均为同一 EIP，且与 GetFunction 返回的 EIP 一致。上海、北京、成都三个地域的 EIP 各不相同。
+- `pool init` 创建 2 个固定 IP 函数总耗时 54.7s，单个约 27s。
+- `pool rotate` 删除旧函数耗时 1.2s，在新地域补位耗时 51s；旧 IP 进入 `banned_ips`，新备用实际出口与池文件记录一致。该次实测使用旧版封禁格式；当前版本已改为默认 24h 的临时封禁，过期后允许该 IP 再入池。
+- 运行中的客户端使用 PoolFile 模式、2s 热加载间隔，在外部 rotate 后约 0.4s 感知切换并触发 OnSwitch，下一次请求即使用新 IP，全程无失败请求。感知时间取决于热加载轮询时机。
+
+建议将切换与补位分开看待：切换即时生效，补位约 50s 在后台完成；若担心补位窗口期内新主用也被封，可将 `Size` 设为 3。
+
+### 可选自动补充
+
+自动补充与代理分离，默认不启用；普通代理不需要腾讯云凭证。以下代码展示应用初始化时创建补充器，再由切换回调触发补充：
+
+```go
+packageData, err := os.ReadFile("dist/scf-server.zip")
+if err != nil { return err }
+mgr, err := scfpool.NewManagerFromEnv(scfpool.Options{
+    PoolFile: "pool.json",
+    Regions: []string{"ap-singapore", "ap-tokyo", "ap-seoul"},
+    Size: 2,
+    Token: os.Getenv("SCFPROXY_TOKEN"),
+    Package: packageData,
+})
+if err != nil { return err }
+if err := mgr.Init(ctx); err != nil { return err }
+p, err := scfproxy.New(scfproxy.Config{
+    PoolFile: "pool.json",
+    Token: os.Getenv("SCFPROXY_TOKEN"),
+    OnSwitch: func(old, next scfproxy.EndpointInfo, reason string) {
+        go func() {
+            report, err := mgr.Replenish(ctx)
+            if err != nil { log.Printf("补充失败: %v", err) }
+            _ = report
+        }()
+    },
+})
+if err != nil { return err }
+defer p.Close()
+```
+
+应用需 import `github.com/zcw199604/scfproxy/pkg/scfpool` 并管理 ctx 的生命周期。也可通过 `NewManager` 传入自建 Factory，以应用持有的临时凭证创建 SDK 客户端。凭证与 token 只驻留内存及云函数所需环境变量，池文件不保存。Replenish 多次并发触发会串行执行。
+
+### 文件锁与并发边界
+
+池文件事务位于 `internal/poolfile`，由 `pkg/scfpool` 与 `pkg/scfproxy` 共用，避免部署探测模块与客户端形成循环依赖。读写都对独立的 `<pool>.lock` 加排他锁，在锁内读最新状态、修改并通过同目录临时文件 rename 原子替换。云资源管理使用独立管理锁串行化；云调用期间不占池数据锁，Switch 可同时进行，补充落盘时重新读取最新状态，不用旧快照覆盖切换结果。
+
+Unix 使用 `syscall.Flock`，请使用支持本地文件锁与原子 rename 的文件系统；不要删除运行中的 `.lock` 文件。Windows 退化为无跨进程文件锁，不支持多个进程并发管理同一个池。进程内补充操作仍由互斥锁串行化。`pool.json` 已加入 `.gitignore`，自定义池路径也应自行忽略。
+
+真实上云请重点验证：不同地域是否得到不同 EIP；EIP 出现和全部删除后释放/重分配的时延；重建撞到 banned IP 时的清理和重试；显式切换后旧 HTTP/WS 长连接是否按预期断开并使用新 IP；并发自动/手动补充的恢复行为；固定 IP 网关费用、配额与 100Mbps 限制。所有新增自动化测试只使用本地服务和假 SCFAPI，本轮未进行云验证。

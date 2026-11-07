@@ -1,2 +1,5 @@
 /dist/
 endpoints.txt
+pool.json
+pool.json.lock
+pool.json.manage.lock
