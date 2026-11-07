@@ -43,7 +43,10 @@ type Options struct {
 	MaxAttempts                  int
 	EgressIPTimeout              time.Duration
 	BanTTL                       time.Duration
-	Logger                       *slog.Logger
+	MaxConcurrency               int
+	// DisableConcurrency 显式不设置多并发；否则 MaxConcurrency=0 使用默认10。
+	DisableConcurrency bool
+	Logger             *slog.Logger
 }
 type Change struct {
 	Endpoint
@@ -59,6 +62,14 @@ type Manager struct {
 func NewManager(factory deploy.Factory, opts Options) (*Manager, error) {
 	if opts.BanTTL == 0 {
 		opts.BanTTL = poolfile.DefaultBanTTL
+	}
+	if opts.MaxConcurrency < 0 || opts.MaxConcurrency > 100 {
+		return nil, errors.New("max-concurrency 必须在0~100之间")
+	}
+	if opts.DisableConcurrency {
+		opts.MaxConcurrency = 0
+	} else if opts.MaxConcurrency == 0 {
+		opts.MaxConcurrency = 10
 	}
 	if opts.PoolFile == "" {
 		return nil, errors.New("scfpool: PoolFile 不能为空")
@@ -233,7 +244,7 @@ func (m *Manager) run(ctx context.Context, init, destroy bool) (Report, error) {
 				return report, errors.Join(failures...)
 			}
 			start := time.Now()
-			o := deploy.Options{Regions: []string{pending.Region}, Count: 1, Prefix: m.opts.Prefix, Runtime: m.opts.Runtime, Token: m.opts.Token, Package: m.opts.Package, Timeout: m.opts.Timeout, IdleTimeout: m.opts.IdleTimeout, Memory: m.opts.Memory, Concurrency: 1, FixedIP: true}
+			o := deploy.Options{Regions: []string{pending.Region}, Count: 1, Prefix: m.opts.Prefix, Runtime: m.opts.Runtime, Token: m.opts.Token, Package: m.opts.Package, Timeout: m.opts.Timeout, IdleTimeout: m.opts.IdleTimeout, Memory: m.opts.Memory, Concurrency: 1, FixedIP: true, MaxConcurrency: m.opts.MaxConcurrency}
 			result := dm.Create(ctx, o, deploy.Endpoint{Region: pending.Region, Function: pending.Function})
 			if result.Existed {
 				// 不接管同名既有函数，撤销本地意图后换名；不删除该远端资源。

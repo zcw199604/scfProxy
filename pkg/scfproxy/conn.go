@@ -12,24 +12,32 @@ import (
 
 type targetAddr string
 
+// TunnelInfo 提供握手时的实例快照；旧服务端分别返回空字符串和零。
+type TunnelInfo interface {
+	InstanceID() string
+	InstanceActive() int
+}
+
 func (a targetAddr) Network() string { return "tcp" }
 func (a targetAddr) String() string  { return string(a) }
 
 // tunnelConn 的 net.Pipe 提供并发及 deadline 语义，泵只持有一个消息大小的缓冲。
 type tunnelConn struct {
 	net.Conn
-	peer    net.Conn
-	w       *warmConn
-	addr    string
-	cfg     Config
-	ctx     context.Context
-	cancel  context.CancelFunc
-	once    sync.Once
-	upDone  chan struct{}
-	done    chan struct{}
-	closing atomic.Bool
-	workers sync.WaitGroup
-	onClose func(*tunnelConn)
+	peer           net.Conn
+	w              *warmConn
+	addr           string
+	instance       string
+	instanceActive int
+	cfg            Config
+	ctx            context.Context
+	cancel         context.CancelFunc
+	once           sync.Once
+	upDone         chan struct{}
+	done           chan struct{}
+	closing        atomic.Bool
+	workers        sync.WaitGroup
+	onClose        func(*tunnelConn)
 }
 
 func newTunnel(w *warmConn, addr string, cfg Config, onClose func(*tunnelConn)) *tunnelConn {
@@ -38,6 +46,8 @@ func newTunnel(w *warmConn, addr string, cfg Config, onClose func(*tunnelConn)) 
 	return &tunnelConn{Conn: a, peer: b, w: w, addr: addr, cfg: cfg, ctx: ctx, cancel: cancel, upDone: make(chan struct{}), done: make(chan struct{}), onClose: onClose}
 }
 func (c *tunnelConn) RemoteAddr() net.Addr { return targetAddr(c.addr) }
+func (c *tunnelConn) InstanceID() string   { return c.instance }
+func (c *tunnelConn) InstanceActive() int  { return c.instanceActive }
 func (c *tunnelConn) start() {
 	c.workers.Add(2)
 	go func() { defer c.workers.Done(); c.upload() }()

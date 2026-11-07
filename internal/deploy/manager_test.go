@@ -16,6 +16,7 @@ import (
 func ptr[T any](v T) *T { return &v }
 
 type fakeAPI struct {
+	updateConfig  func(*scf.UpdateFunctionConfigurationRequest) error
 	update        func(*scf.UpdateFunctionCodeRequest) error
 	create        func(*scf.CreateFunctionRequest) error
 	get           func() (*scf.GetFunctionResponse, error)
@@ -24,6 +25,13 @@ type fakeAPI struct {
 	list          func(*scf.ListFunctionsRequest) (*scf.ListFunctionsResponse, error)
 	delete        func(*scf.DeleteFunctionRequest) error
 	deleteTrigger func(*scf.DeleteTriggerRequest) error
+}
+
+func (f *fakeAPI) UpdateFunctionConfigurationWithContext(_ context.Context, r *scf.UpdateFunctionConfigurationRequest) (*scf.UpdateFunctionConfigurationResponse, error) {
+	if f.updateConfig != nil {
+		return nil, f.updateConfig(r)
+	}
+	return &scf.UpdateFunctionConfigurationResponse{}, nil
 }
 
 func (f *fakeAPI) CreateFunctionWithContext(_ context.Context, r *scf.CreateFunctionRequest) (*scf.CreateFunctionResponse, error) {

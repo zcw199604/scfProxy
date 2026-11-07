@@ -16,6 +16,7 @@ import (
 
 // SCFAPI 是部署管理需要的最小 SDK 接口，测试使用本地假实现。
 type SCFAPI interface {
+	UpdateFunctionConfigurationWithContext(context.Context, *scf.UpdateFunctionConfigurationRequest) (*scf.UpdateFunctionConfigurationResponse, error)
 	UpdateFunctionCodeWithContext(context.Context, *scf.UpdateFunctionCodeRequest) (*scf.UpdateFunctionCodeResponse, error)
 	CreateFunctionWithContext(context.Context, *scf.CreateFunctionRequest) (*scf.CreateFunctionResponse, error)
 	GetFunctionWithContext(context.Context, *scf.GetFunctionRequest) (*scf.GetFunctionResponse, error)

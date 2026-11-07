@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -64,7 +65,7 @@ func confirm(in io.Reader, out io.Writer, interactive, yes bool) error {
 }
 func run(ctx context.Context, args []string, in io.Reader, out io.Writer, interactive bool) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		fmt.Fprintln(out, "用法: scfproxy <gen-token|deploy|list|delete|check|bench|pool> [参数]\n使用 scfproxy <子命令> -h 查看帮助。部署前请先 make package-server。")
+		fmt.Fprintln(out, "用法: scfproxy <gen-token|deploy|list|delete|check|bench|concurrency|pool> [参数]\n使用 scfproxy <子命令> -h 查看帮助。部署前请先 make package-server。")
 		return nil
 	}
 	var err error
@@ -82,6 +83,8 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer, intera
 		}
 	case "pool":
 		err = poolCommand(ctx, args[1:], in, out, interactive)
+	case "concurrency":
+		err = concurrencyCommand(ctx, args[1:], out)
 	case "deploy", "list", "delete":
 		err = manage(ctx, args[0], args[1:], in, out, interactive)
 	case "check", "bench":
@@ -138,6 +141,8 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 		fs.BoolVar(&o.FixedIP, "fixed-ip", false, "开启固定公网出口IP（同账号同地域共享）")
 		fs.DurationVar(&eipTimeout, "eip-timeout", 3*time.Minute, "等待固定公网IP出现的总超时")
 		fs.BoolVar(&o.UpdateCode, "update-code", false, "更新已有且属于scfproxy的函数代码，不修改配置或token")
+		fs.BoolVar(&o.UpdateConfig, "update-config", false, "更新已有且归属匹配函数的内存和单实例并发配置")
+		fs.IntVar(&o.MaxConcurrency, "max-concurrency", 10, "单实例请求并发数0~100；0创建时不设置，update-config时取消")
 		fs.IntVar(&o.Count, "n", 1, "每地域函数数量")
 		fs.StringVar(&packagePath, "package", "dist/scf-server.zip", "make package-server生成的zip")
 		fs.StringVar(&o.Runtime, "runtime", "Go1", "运行时，实测可改CustomRuntime")
@@ -175,7 +180,7 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "部署计划: runtime=%s timeout=%ds idle-timeout=%ds memory=%dMB update-code=%v 共%d个函数\n", o.Runtime, o.Timeout, o.IdleTimeout, o.Memory, o.UpdateCode, len(plan))
+		fmt.Fprintf(out, "部署计划: runtime=%s timeout=%ds idle-timeout=%ds memory=%dMB max-concurrency=%d update-code=%v update-config=%v 共%d个函数\n", o.Runtime, o.Timeout, o.IdleTimeout, o.Memory, o.MaxConcurrency, o.UpdateCode, o.UpdateConfig, len(plan))
 		if o.FixedIP {
 			fmt.Fprintln(out, "固定出口IP已开启；固定IP网关可能产生额外费用。 ")
 			if o.Count > 1 {
@@ -203,9 +208,12 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 		failed := 0
 		for _, r := range results {
 			if r.Updated {
-				fmt.Fprintf(out, "%s %s 代码已更新，保留现有运行时、配置和token\n", r.Region, r.Function)
-			} else if r.Existed {
+				fmt.Fprintf(out, "%s %s 代码已更新，保留现有运行时和token\n", r.Region, r.Function)
+			} else if r.Existed && !o.UpdateConfig {
 				fmt.Fprintf(out, "%s %s 已存在，未更新代码或token；更新请先 delete 再 deploy\n", r.Region, r.Function)
+			}
+			if r.ConfigUpdated {
+				fmt.Fprintf(out, "%s %s 配置已更新：memory=%dMB max-concurrency=%d\n", r.Region, r.Function, o.Memory, o.MaxConcurrency)
 			}
 			if r.Err != nil {
 				failed++
@@ -231,7 +239,11 @@ func manage(ctx context.Context, command string, args []string, in io.Reader, ou
 		return err
 	}
 	for _, item := range items {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t出口IP=%s\n", item.Region, item.Function, item.Status, item.URL, item.EgressIP)
+		concurrency := "-"
+		if item.MaxConcurrency != nil {
+			concurrency = strconv.FormatUint(*item.MaxConcurrency, 10)
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t出口IP=%s\t单实例并发=%s\n", item.Region, item.Function, item.Status, item.URL, item.EgressIP, concurrency)
 		if item.URLWarning != nil {
 			fmt.Fprintf(out, "  URL获取提示: %v\n", deploy.SafeError(item.URLWarning))
 		}

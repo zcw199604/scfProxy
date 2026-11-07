@@ -2,6 +2,7 @@ package scfpool
 
 import (
 	"context"
+	"fmt"
 	scf "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/scf/v20180416"
 	"github.com/zcw199604/scfproxy/internal/deploy"
 	"github.com/zcw199604/scfproxy/internal/poolfile"
@@ -19,6 +20,9 @@ func TestNewManagerDefaultsAndEmptyStatus(t *testing.T) {
 	}
 	if m.opts.Memory != 64 {
 		t.Fatalf("默认内存=%dMB，期望64MB", m.opts.Memory)
+	}
+	if m.opts.MaxConcurrency != 10 {
+		t.Fatalf("默认并发=%d，期望10", m.opts.MaxConcurrency)
 	}
 	s, err := m.Status(context.Background())
 	if err != nil || s.Version != 1 || len(s.Active) != 0 {
@@ -43,6 +47,7 @@ type api struct {
 	deploy.SCFAPI
 	c                *cloud
 	region, name, ip string
+	concurrency      *scf.InstanceConcurrencyConfig
 }
 
 func (c *cloud) factory(region string) (deploy.SCFAPI, error) {
@@ -65,6 +70,7 @@ func (a *api) CreateFunctionWithContext(_ context.Context, r *scf.CreateFunction
 	a.c.mu.Lock()
 	defer a.c.mu.Unlock()
 	a.name = *r.FunctionName
+	a.concurrency = r.InstanceConcurrencyConfig
 	a.c.events = append(a.c.events, "create:"+a.region)
 	list := a.c.ips[a.region]
 	if len(list) == 0 {
@@ -76,6 +82,56 @@ func (a *api) CreateFunctionWithContext(_ context.Context, r *scf.CreateFunction
 		}
 	}
 	return &scf.CreateFunctionResponse{}, nil
+}
+
+func TestPoolMaxConcurrencyForwardingAndValidation(t *testing.T) {
+	c := &cloud{}
+	o := opts(t)
+	o.MaxConcurrency = 7
+	m, err := NewManager(c.factory, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range c.clients {
+		if a.concurrency == nil || *a.concurrency.MaxConcurrency != 7 || *a.concurrency.DynamicEnabled != "FALSE" || *a.concurrency.Type != "Request-Based" {
+			t.Fatalf("未传递并发配置: %+v", a.concurrency)
+		}
+	}
+	for _, n := range []int{-1, 101} {
+		o.MaxConcurrency = n
+		if _, err = NewManager(c.factory, o); err == nil {
+			t.Fatalf("接受无效并发数%d", n)
+		}
+	}
+}
+
+func TestPoolDefaultAndDisabledConcurrency(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(disabled), func(t *testing.T) {
+			c := &cloud{}
+			o := opts(t)
+			o.DisableConcurrency = disabled
+			m, err := NewManager(c.factory, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = m.Init(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for _, a := range c.clients {
+				if disabled {
+					if a.concurrency != nil {
+						t.Fatalf("显式关闭仍发送并发配置: %+v", a.concurrency)
+					}
+				} else if a.concurrency == nil || *a.concurrency.MaxConcurrency != 10 {
+					t.Fatalf("默认并发不是10: %+v", a.concurrency)
+				}
+			}
+		})
+	}
 }
 func (a *api) GetFunctionWithContext(_ context.Context, _ *scf.GetFunctionRequest) (*scf.GetFunctionResponse, error) {
 	a.c.mu.Lock()

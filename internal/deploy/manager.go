@@ -18,6 +18,8 @@ import (
 
 type Options struct {
 	UpdateCode                   bool
+	UpdateConfig                 bool
+	MaxConcurrency               int
 	FixedIP                      bool
 	Regions                      []string
 	Count                        int
@@ -33,6 +35,8 @@ type Result struct {
 	EgressIP            string
 	Existed             bool
 	Updated             bool
+	ConfigUpdated       bool
+	MaxConcurrency      *uint64
 	Err                 error
 	URLWarning          error
 }
@@ -53,6 +57,9 @@ func value[T any](p *T) (v T) {
 func ref[T any](v T) *T { return &v }
 
 func Plan(o Options) ([]Endpoint, error) {
+	if o.MaxConcurrency < 0 || o.MaxConcurrency > 100 {
+		return nil, errors.New("max-concurrency 必须在0~100之间")
+	}
 	if len(o.Regions) == 0 || o.Count < 1 {
 		return nil, errors.New("至少指定一个地域，且数量必须大于0")
 	}
@@ -148,6 +155,9 @@ func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 	if o.FixedIP {
 		r.PublicNetConfig = &scf.PublicNetConfigIn{PublicNetStatus: ref("ENABLE"), EipConfig: &scf.EipConfigIn{EipStatus: ref("ENABLE")}}
 	}
+	if o.MaxConcurrency > 0 {
+		r.InstanceConcurrencyConfig = instanceConcurrency(o.MaxConcurrency)
+	}
 	_, err = api.CreateFunctionWithContext(ctx, r)
 	if err != nil {
 		if code := ErrorCode(err); code == "ResourceInUse.Function" || code == "ResourceInUse.FunctionName" || code == "ResourceInUse.FunctionAlreadyExists" {
@@ -157,7 +167,7 @@ func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 			return result
 		}
 	}
-	if result.Existed && o.UpdateCode {
+	if result.Existed && (o.UpdateCode || o.UpdateConfig) {
 		get := scf.NewGetFunctionRequest()
 		get.FunctionName = ref(e.Function)
 		get.Namespace = ref("default")
@@ -170,18 +180,38 @@ func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 			result.Err = errors.New("拒绝更新：函数前缀或Description不属于scfproxy")
 			return result
 		}
-		update := scf.NewUpdateFunctionCodeRequest()
-		update.FunctionName = ref(e.Function)
-		update.Namespace = ref("default")
-		update.ZipFile = r.Code.ZipFile
-		update.CodeSource = ref("ZipFile")
-		// UpdateFunctionCode 不提供 Runtime 字段，沿用原函数运行时和 Handler。
-		update.Handler = current.Response.Handler
-		if _, err = api.UpdateFunctionCodeWithContext(ctx, update); err != nil {
-			result.Err = err
-			return result
+		if o.UpdateCode {
+			update := scf.NewUpdateFunctionCodeRequest()
+			update.FunctionName = ref(e.Function)
+			update.Namespace = ref("default")
+			update.ZipFile = r.Code.ZipFile
+			update.CodeSource = ref("ZipFile")
+			// UpdateFunctionCode 不提供 Runtime 字段，沿用原函数运行时和 Handler。
+			update.Handler = current.Response.Handler
+			if _, err = api.UpdateFunctionCodeWithContext(ctx, update); err != nil {
+				result.Err = err
+				return result
+			}
+			result.Updated = true
+			if o.UpdateConfig {
+				if err = m.waitActive(ctx, api, e.Function); err != nil {
+					result.Err = err
+					return result
+				}
+			}
 		}
-		result.Updated = true
+		if o.UpdateConfig {
+			update := scf.NewUpdateFunctionConfigurationRequest()
+			update.FunctionName = ref(e.Function)
+			update.Namespace = ref("default")
+			update.MemorySize = ref(o.Memory)
+			update.InstanceConcurrencyConfig = instanceConcurrency(o.MaxConcurrency)
+			if _, err = api.UpdateFunctionConfigurationWithContext(ctx, update); err != nil {
+				result.Err = err
+				return result
+			}
+			result.ConfigUpdated = true
+		}
 	}
 	if err = m.waitActive(ctx, api, e.Function); err != nil {
 		result.Err = err
@@ -193,6 +223,13 @@ func (m *Manager) deployOne(ctx context.Context, o Options, e Endpoint) Result {
 		result.EgressIP, result.Err = m.WaitEgressIP(ctx, e.Region, e.Function)
 	}
 	return result
+}
+
+func instanceConcurrency(n int) *scf.InstanceConcurrencyConfig {
+	if n == 0 {
+		return &scf.InstanceConcurrencyConfig{DynamicEnabled: ref("")}
+	}
+	return &scf.InstanceConcurrencyConfig{DynamicEnabled: ref("FALSE"), MaxConcurrency: ref(uint64(n)), Type: ref("Request-Based")}
 }
 
 // egressIP 优先读取新公网配置，兼容旧响应字段；忽略尚未分配的空值。
@@ -462,9 +499,12 @@ func (m *Manager) List(ctx context.Context, regions []string, prefix string) ([]
 				get.Namespace = ref("default")
 				detail, getErr := api.GetFunctionWithContext(ctx, get)
 				if getErr != nil {
-					item.URLWarning = errors.Join(item.URLWarning, fmt.Errorf("读取固定出口IP: %w", getErr))
+					item.URLWarning = errors.Join(item.URLWarning, fmt.Errorf("读取函数详情（出口IP/并发配置）: %w", getErr))
 				} else if detail != nil {
 					item.EgressIP = egressIP(detail.Response)
+					if detail.Response != nil && detail.Response.InstanceConcurrencyConfig != nil {
+						item.MaxConcurrency = detail.Response.InstanceConcurrencyConfig.MaxConcurrency
+					}
 				}
 				results = append(results, item)
 			}

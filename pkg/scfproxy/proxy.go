@@ -364,6 +364,7 @@ endpoints:
 			return nil, ctx.Err()
 		}
 		w := p.take(ctx, i)
+		var reply protocol.Response
 		fromPool := w != nil
 		for {
 			if w == nil {
@@ -385,7 +386,7 @@ endpoints:
 					e = w.ws.Write(ctx, websocket.MessageText, b)
 				}
 			}
-			var reply protocol.Response
+			reply = protocol.Response{}
 			if e == nil {
 				select {
 				case f, ok := <-w.frames:
@@ -426,6 +427,7 @@ endpoints:
 			break
 		}
 		c := newTunnel(w, addr, p.cfg, func(c *tunnelConn) { p.mu.Lock(); delete(p.active, c); p.mu.Unlock() })
+		c.instance, c.instanceActive = reply.Instance, reply.Active
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()

@@ -42,6 +42,7 @@ func poolCommand(ctx context.Context, args []string, in io.Reader, out io.Writer
 		fs.Int64Var(&opts.Timeout, "timeout", 900, "函数执行超时秒数")
 		fs.Int64Var(&opts.IdleTimeout, "idle-timeout", 600, "WS空闲超时秒数")
 		fs.Int64Var(&opts.Memory, "memory", 64, "函数内存MB")
+		fs.IntVar(&opts.MaxConcurrency, "max-concurrency", 10, "单实例请求并发数0~100，0不设置")
 		fs.IntVar(&opts.MaxAttempts, "max-attempts", 3, "单个补位的IP冲突重建次数上限")
 		fs.DurationVar(&opts.EgressIPTimeout, "eip-timeout", 3*time.Minute, "每次创建等待EIP的总超时")
 	}
@@ -98,6 +99,10 @@ func poolCommand(ctx context.Context, args []string, in io.Reader, out io.Writer
 		return switchPool(out, opts.PoolFile, reason, opts.BanTTL)
 	}
 	if creating {
+		if opts.MaxConcurrency < 0 || opts.MaxConcurrency > 100 {
+			return errors.New("max-concurrency 必须在0~100之间")
+		}
+		opts.DisableConcurrency = opts.MaxConcurrency == 0
 		var err error
 		opts.Regions, err = deploy.ResolveRegions(regions, "")
 		if err != nil {
@@ -118,7 +123,7 @@ func poolCommand(ctx context.Context, args []string, in io.Reader, out io.Writer
 			return err
 		}
 	}
-	fmt.Fprintf(out, "pool %s 计划: 文件=%s 前缀=%s 地域=%v 目标数量=%d；将创建或删除计费云资源。\n", command, opts.PoolFile, opts.Prefix, opts.Regions, opts.Size)
+	fmt.Fprintf(out, "pool %s 计划: 文件=%s 前缀=%s 地域=%v 目标数量=%d 单实例并发=%d；将创建或删除计费云资源。\n", command, opts.PoolFile, opts.Prefix, opts.Regions, opts.Size, opts.MaxConcurrency)
 	if err := confirm(in, out, interactive, yes); err != nil {
 		return err
 	}

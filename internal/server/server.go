@@ -3,6 +3,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -30,11 +32,13 @@ type Config struct {
 }
 
 type Server struct {
-	cfg    Config
-	mu     sync.Mutex
-	closed bool
-	active map[*websocket.Conn]context.CancelFunc
-	nonces map[string]time.Time
+	instance string
+	tunnels  int
+	cfg      Config
+	mu       sync.Mutex
+	closed   bool
+	active   map[*websocket.Conn]context.CancelFunc
+	nonces   map[string]time.Time
 }
 
 func New(cfg Config) (*Server, error) {
@@ -59,7 +63,14 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Server{cfg: cfg, active: make(map[*websocket.Conn]context.CancelFunc), nonces: make(map[string]time.Time)}, nil
+	var id [8]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, err
+	}
+	instance := hex.EncodeToString(id[:])
+	cfg.Logger = cfg.Logger.With("instance", instance)
+	cfg.Logger.Info("隧道实例启动")
+	return &Server{cfg: cfg, instance: instance, active: make(map[*websocket.Conn]context.CancelFunc), nonces: make(map[string]time.Time)}, nil
 }
 
 func (s *Server) Close() error {
@@ -135,7 +146,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var up, down int64
 	var reason = "握手结束"
 	defer func() {
-		s.cfg.Logger.Info("连接结束", "target", s.diagnostic(target, signature), "reason", s.diagnostic(reason, signature), "up_bytes", up, "down_bytes", down)
+		s.mu.Lock()
+		active := s.tunnels
+		s.mu.Unlock()
+		s.cfg.Logger.Info("连接结束", "target", s.diagnostic(target, signature), "reason", s.diagnostic(reason, signature), "up_bytes", up, "down_bytes", down, "active", active)
 	}()
 	ws.SetReadLimit(4096)
 	preCtx, preCancel := context.WithTimeout(ctx, s.cfg.PrewarmTimeout)
@@ -186,8 +200,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tcp.Close()
-	s.cfg.Logger.Info("目标已连接", "target", s.diagnostic(target, signature))
-	if !respond(protocol.Response{OK: true}) {
+	s.mu.Lock()
+	s.tunnels++
+	active := s.tunnels
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.tunnels--; s.mu.Unlock() }()
+	s.cfg.Logger.Info("目标已连接", "target", s.diagnostic(target, signature), "active", active)
+	if !respond(protocol.Response{OK: true, Instance: s.instance, Active: active}) {
 		return
 	}
 	ws.SetReadLimit(256 * 1024)

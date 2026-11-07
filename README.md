@@ -10,37 +10,77 @@ Go 业务程序 → scfproxy.DialContext → ws/wss 函数 URL → scf-server �
 
 一条 WS 承载一条 TCP 连接，不多路复用，也不做 HTTP 请求打包。TLS 在业务客户端与目标之间协商，隧道传输原始字节，因此支持 HTTPS、TLS ALPN HTTP/2、SSE 和 WebSocket。函数进程监听 `0.0.0.0:9000`，endpoint 的路径和查询参数原样用于建连；认证完全在 WS 内进行，不依赖平台转发认证头。目标地址、DNS 和 TCP 拨号发生在服务端。
 
-## 接入
+## 快速接入其他 Go 项目
+
+下面片段放在返回 `error` 的业务函数中；普通模式和固定 IP 模式二选一，再接入共用的 HTTP/WebSocket 客户端。完整可编译示例见 [example_test.go](pkg/scfproxy/example_test.go)，Example 只检查编译，不在测试中执行网络或云调用。普通隧道库不需要腾讯云凭证，自动补位才需要。
+
+普通模式（导入 `context`、`os` 和 `github.com/zcw199604/scfproxy/pkg/scfproxy`）：
 
 ```go
-import (
-    "net/http"
-    "os"
-
-    "github.com/zcw199604/scfproxy/pkg/scfproxy"
-    "github.com/gorilla/websocket" // 此处为业务项目自行选择的客户端
-)
-
+ctx := context.Background() // 实际应用可改用自己的生命周期ctx
 p, err := scfproxy.New(scfproxy.Config{
     EndpointsFile: "endpoints.txt",
-    Token:         os.Getenv("SCFPROXY_TOKEN"),
-    Strategy:      scfproxy.StickyByHost, // 或 scfproxy.Random（默认）
-    Bypass:        []string{"localhost", "*.internal", "10.0.0.0/8"},
+    Token: os.Getenv("SCFPROXY_TOKEN"),
 })
-if err != nil {
-    panic(err)
-}
+if err != nil { return err }
 defer p.Close()
+```
 
+固定 IP 模式及可选自动补位（另导入 `log` 和 `github.com/zcw199604/scfproxy/pkg/scfpool`）：
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+packageData, err := os.ReadFile("dist/scf-server.zip")
+if err != nil { return err }
+mgr, err := scfpool.NewManagerFromEnv(scfpool.Options{
+    PoolFile: "pool.json",
+    Regions: []string{"ap-shanghai", "ap-beijing", "ap-chengdu"},
+    Size: 2,
+    Token: os.Getenv("SCFPROXY_TOKEN"),
+    Package: packageData, // 默认64MB、单实例并发10
+})
+if err != nil { return err }
+if err := mgr.Init(ctx); err != nil { return err } // 空池才创建；已有池保留主用
+p, err := scfproxy.New(scfproxy.Config{
+    PoolFile: "pool.json",
+    Token: os.Getenv("SCFPROXY_TOKEN"),
+    OnSwitch: func(old, next scfproxy.EndpointInfo, reason string) {
+        log.Printf("出口切换 %s -> %s: %s", old.EgressIP, next.EgressIP, reason)
+        // 库已异步调用OnSwitch，补位器内部串行，无需再创建协程。
+        if _, err := mgr.Replenish(ctx); err != nil { log.Printf("自动补位失败: %v", err) }
+    },
+})
+if err != nil { return err }
+defer p.Close()
+// 业务确认IP被封时才调用p.Switch(reason)，临时故障不会自动切到备用。
+```
+
+只使用已存在的固定池、不自动补位时，仅需 `scfproxy.New(scfproxy.Config{PoolFile: "pool.json", Token: os.Getenv("SCFPROXY_TOKEN")})`，无需 Manager、代码包或云凭证。自动补位的创建/删除会产生云资源操作，凭证从腾讯云环境变量读取。
+
+两种模式共用以下客户端代码，导入 `net/http`、`coder "github.com/coder/websocket"`、`gorilla "github.com/gorilla/websocket"`：
+
+```go
 transport := p.Transport()
 defer transport.CloseIdleConnections()
-httpClient := &http.Client{Transport: transport}
-gorillaDialer := websocket.Dialer{NetDialContext: p.DialContext}
-_ = httpClient
-_ = gorillaDialer
-// coder/websocket: websocket.Dial(ctx, url,
-//     &websocket.DialOptions{HTTPClient: httpClient})
+httpClient := &http.Client{Transport: transport} // HTTP/HTTPS、HTTP/2、SSE
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
+if err != nil { return err }
+resp, err := httpClient.Do(req)
+if err != nil { return err }
+// SSE可在此逐段读取resp.Body，无需等待完整响应。
+resp.Body.Close()
+
+gorillaDialer := gorilla.Dialer{NetDialContext: p.DialContext}
+g, _, err := gorillaDialer.DialContext(ctx, "wss://example.com/ws", nil)
+if err != nil { return err }
+defer g.Close()
+c, _, err := coder.Dial(ctx, "wss://example.com/ws", &coder.DialOptions{HTTPClient: httpClient})
+if err != nil { return err }
+defer c.Close(coder.StatusNormalClosure, "")
 ```
+
+请把示例请求地址替换为业务自己的 HTTP/WS 地址。
 
 `endpoints.txt` 每行一个 `wss://` 或 `ws://` 地址；忽略空行和去掉首尾空白后以 `#` 开头的行。与 `Endpoints` 合并，顺序保留。线上应使用 `wss://`，本地测试使用 `ws://`。
 
@@ -107,7 +147,7 @@ Token 为空时拒绝启动。普通 HTTP 请求（包括 `/healthz`）返回 `2
 
 拨号先检查所有解析结果，再按 IPv4 优先、IPv6 其后的顺序直接拨 IP。每个 IP 分配 `min(剩余预算, max(剩余预算/剩余IP数, 2s))` 的超时，避免单个黑洞地址耗尽全部预算。失败回复与 slog 日志包含脱敏的 DNS 原因、已尝试 IP 及错误；禁止地址会说明解析 IP 和禁止类别，不包含 token 或签名。
 
-签名原文为 UTF-8 `v|target|ts|nonce`，版本与 Unix 秒为十进制，无末尾换行。服务端校验版本、±300 秒时差、16 字节 nonce 和 HMAC（常量时间比较），使用有到期时间、最多 65536 项的进程内缓存防重放。成功回复文本 `{"ok":true}`；失败返回 `ok:false` 及 `auth_failed`、`bad_request`、`forbidden_target` 或 `dial_failed`。然后只允许二进制消息作为 TCP 字节流，正常关闭使用 WS 1000。
+签名原文为 UTF-8 `v|target|ts|nonce`，版本与 Unix 秒为十进制，无末尾换行。服务端校验版本、±300 秒时差、16 字节 nonce 和 HMAC（常量时间比较），使用有到期时间、最多 65536 项的进程内缓存防重放。成功回复文本形如 `{"ok":true,"instance":"0123456789abcdef","active":1}`，兼容旧版只含 `ok` 的握手；失败返回 `ok:false` 及 `auth_failed`、`bad_request`、`forbidden_target` 或 `dial_failed`。然后只允许二进制消息作为 TCP 字节流，正常关闭使用 WS 1000。
 
 服务端先解析目标，**检查所有解析结果后直接拨号已检查的 IP**，拒绝混有禁用地址的 DNS 结果，避免二次解析造成 DNS rebinding。默认拒绝 unspecified、loopback、RFC1918、link-local（包括元数据地址）、100.64.0.0/10、组播、IPv6 ULA 以及相应 IPv4-mapped 地址。`AllowPrivate` 会放开这些限制，只用于本地可信测试。
 
@@ -126,7 +166,7 @@ zip 根目录仅包含 `scf-server` 与可执行的 `scf_bootstrap`；启动脚�
 
 ## 已知限制
 
-- SCF 每条 WS 对应一个实例；每个新 TCP 流仍需独立 WS，预热会占用实例和费用。
+- 每个新 TCP 流仍需独立 WS，预热会占用连接和费用。已在广州64MB实测确认请求多并发可让多条 WS 共享实例；实例异常会同时中断其承载的连接，参见“单实例多并发”。
 - 平台单消息 256 KiB、约 128 KiB/s、10 QPS 限制应结合实际套餐确认；Ping 等控制帧也可能计入平台限制，建议留出余量。下行限制可独立设置。
 - 平台空闲超时及函数最长执行时间仍可能断开连接。Ping 不能延长函数执行上限；业务方负责重连和流恢复，库不会自动重放已发送业务数据。
 - nonce 缓存仅在一个服务端进程有效，无法提供跨 SCF 实例防重放保证。保持时钟同步、使用高熵 token。
@@ -176,21 +216,23 @@ export SCFPROXY_TOKEN="$(./dist/scfproxy gen-token)"
 | `--package` | dist/scf-server.zip；检查根目录仅有两个非空可执行文件 |
 | `--runtime` | Go1；创建时可改 CustomRuntime；代码更新沿用现有 Runtime |
 | `--update-code` | false；更新已有且名称前缀、Description 均匹配的函数代码 |
+| `--update-config` | false；更新归属匹配函数的内存及单实例并发配置，可与 update-code 同用 |
+| `--max-concurrency` | 10；范围 0–100，创建时显式 0 不设置，update-config 时显式 0 取消多并发 |
 | `--timeout` | 900 秒；必须不小于 idle-timeout |
 | `--idle-timeout` | 600 秒；必须为正数，实际平台范围待确认 |
-| `--memory` | 64 MB；实际可用规格由平台校验，WS Web 函数创建与运行待下次上云确认 |
+| `--memory` | 64 MB；已在广州验证 WS Web 函数创建及运行成功 |
 | `--concurrency` | 8；最多同时进行的函数创建流程 |
 | `--wait-timeout` | 3 分钟；每个函数等待 Active 的总超时 |
 | `-o` | endpoints.txt；成功地址合并去重，附加地域/函数名注释，权限 0644 |
 | `--yes` | 跳过交互确认；非交互环境必须显式提供 |
 
-`deploy --memory`、pool 创建类子命令的 `--memory` 及 `scfpool.Options.Memory` 的零值默认均为 64MB。本地实测经隧道不限速下载 100MB + 上传 20MB，scf-server 最大常驻内存为 17.4MB；函数端不做 TLS，单实例单连接，缓冲区固定，内存不随传输量增长。64MB 资源费约为 128MB 的一半；64MB 在 WS Web 函数上的创建与运行待下次上云确认。
+`deploy --memory`、pool 创建类子命令的 `--memory` 及 `scfpool.Options.Memory` 的零值默认均为 64MB。本地实测经隧道不限速下载 100MB + 上传 20MB，scf-server 最大常驻内存为 17.4MB；这是单实例单连接基线，函数端不做 TLS，每条隧道缓冲区固定，内存不随传输量增长。多并发时总内存会随连接数增加。64MB 资源费约为 128MB 的一半；64MB 的 WS Web 函数已在广州验证创建及运行成功。
 
 `scf_bootstrap` 启动前默认设置 `GOMEMLIMIT=40MiB`，为 Go 运行时设置软内存上限，给进程其他内存及平台开销留出余量；可通过同名环境变量覆盖。它不等同于进程常驻内存的硬限制。打包保留启动脚本的可执行权限。
 
 创建请求采用 `Namespace=default`、`Type=HTTP`、`ProtocolType=WS`、Description 为 `scfproxy` 和 `managed-by=scfproxy` 标签，关闭自动创建 CLS 主题和索引。等待状态 Active 后获取或创建 `func_url` HTTP 触发器，关闭平台 URL 认证、打开公网访问；隧道内仍必须通过 HMAC 认证。创建触发器遇到 FailedOperation 每隔 5 秒重试，最多 10 次。识别函数 URL 时不依赖 TriggerName（平台可能改写为 URL ID），选择带有效外网地址的 HTTP 触发器，多个时优先 `$LATEST`。优先读取 `WssExtranetUrl`，为空才将 `ExtranetUrl` 的 https/http 转为 wss/ws，保留路径和查询参数。
 
-默认同名函数存在时不覆盖代码、运行时、规格或 token，只读取/补建函数 URL。加 `--update-code` 时，先校验名称以 `<prefix>-` 开头且 Description 精确为 `scfproxy`，再调用 UpdateFunctionCode 更新 zip，等待 Active 后读取现有 func_url。SDK 的 UpdateFunctionCode 没有 Runtime 字段，因此沿用现有 Runtime 和 Handler；此参数不更新环境变量、token、内存或超时。需更改这些配置时请单独管理或先 delete 再 deploy。多函数部分失败会输出逐项结果并返回非零退出码，已创建的函数不会自动回滚；请用 list 核查，按需删除。endpoints 文件只保存地址及注释，不含 token。文件合并采用同目录临时文件原子替换；不支持多个 CLI 进程同时编辑同一文件。
+默认同名函数存在时不覆盖代码、运行时、规格或 token，只读取/补建函数 URL。加 `--update-code` 时，先校验名称以 `<prefix>-` 开头且 Description 精确为 `scfproxy`，再调用 UpdateFunctionCode 更新 zip，等待 Active 后读取现有函数 URL。SDK 的 UpdateFunctionCode 没有 Runtime 字段，因此沿用现有 Runtime 和 Handler；此参数不更新环境变量、token、内存或超时。`--update-config` 使用相同归属校验，仅更新内存与请求多并发配置；其他配置需单独管理或先 delete 再 deploy。多函数部分失败会输出逐项结果并返回非零退出码，已创建的函数不会自动回滚；请用 list 核查，按需删除。endpoints 文件只保存地址及注释，不含 token。文件合并采用同目录临时文件原子替换；不支持多个 CLI 进程同时编辑同一文件。
 
 列表和删除：
 
@@ -379,3 +421,59 @@ defer p.Close()
 Unix 使用 `syscall.Flock`，请使用支持本地文件锁与原子 rename 的文件系统；不要删除运行中的 `.lock` 文件。Windows 退化为无跨进程文件锁，不支持多个进程并发管理同一个池。进程内补充操作仍由互斥锁串行化。`pool.json` 已加入 `.gitignore`，自定义池路径也应自行忽略。
 
 真实上云请重点验证：不同地域是否得到不同 EIP；EIP 出现和全部删除后释放/重分配的时延；重建撞到 banned IP 时的清理和重试；显式切换后旧 HTTP/WS 长连接是否按预期断开并使用新 IP；并发自动/手动补充的恢复行为；固定 IP 网关费用、配额与 100Mbps 限制。所有新增自动化测试只使用本地服务和假 SCFAPI，本轮未进行云验证。
+
+## 单实例多并发
+
+服务端可同时处理多条 WS 隧道。每个 scf-server 启动时生成随机的 8 字节 hex 实例 ID，成功握手增加 `instance`、`active` 字段；active 是握手时含本条的活跃隧道数快照，不包含预热或未完成握手的连接。关闭隧道后计数递减，日志记录相同实例 ID 和活跃数。旧客户端可忽略新字段。
+
+客户端返回的隧道连接实现可选接口 `scfproxy.TunnelInfo`：
+
+```go
+conn, err := p.DialContext(ctx, "tcp", "www.baidu.com:80")
+if err != nil { return err }
+defer conn.Close()
+if info, ok := conn.(scfproxy.TunnelInfo); ok {
+    log.Printf("instance=%s active=%d", info.InstanceID(), info.InstanceActive())
+}
+```
+
+`InstanceActive()` 是握手时的快照，不实时更新；旧服务端返回空 ID 和 0。Bypass 的直连不提供该接口。
+
+`deploy` 和 `pool init/replenish/rotate` 支持 `--max-concurrency N`，库补充器对应 `scfpool.Options.MaxConcurrency`。默认并发数为 10，合法范围 0–100；CLI 显式传 `--max-concurrency 0` 时，创建函数不发送多并发配置，保持平台默认每实例一条连接；正数发送静态请求并发：`DynamicEnabled=FALSE`、`Type=Request-Based`、`MaxConcurrency=N`。pool 参数只作用于之后新建的函数，已有池函数需用 deploy 更新配置。库配置 `Options.MaxConcurrency=0`（含省略字段）使用默认 10；显式不设置须传 `Options.DisableConcurrency=true`，该开关优先于 MaxConcurrency（数值仍须合法）。例如 `scfpool.Options{PoolFile: "pool.json", DisableConcurrency: true}` 保留平台默认；普通 `Options{PoolFile: "pool.json"}` 则默认 10。
+
+```bash
+make package-server build-cli
+# 创建时设置；也可在pool init/replenish/rotate上使用同名参数
+./dist/scfproxy deploy -r ap-shanghai --max-concurrency 10 --memory 64 --yes
+# 已有函数：更新内存和并发；同时更新代码以获得实例信息
+./dist/scfproxy deploy -r ap-shanghai --max-concurrency 10 --memory 64 --update-config --update-code --yes
+# 取消多并发配置，仍将内存更新为--memory指定值（默认64MB）
+./dist/scfproxy deploy -r ap-shanghai --max-concurrency 0 --update-config --yes
+./dist/scfproxy list -r ap-shanghai
+```
+
+`--update-config` 只更新名字前缀与 Description 均属于本工具的已有函数，发送 UpdateFunctionConfiguration 后等待 Active。未传 `--max-concurrency` 时同样使用默认 10；显式 N=0 发送 `DynamicEnabled=""` 取消配置；与 `--update-code` 同用时先更新代码、等待 Active，再更新配置、等待 Active。list 从 GetFunction 读取单实例并发数，读不到时显示 `-`。命令仍沿用 deploy 的 token、代码包和确认检查；更新配置不会修改 token、超时或运行时。
+
+```bash
+# 只连接endpoints.txt的第一个地址，不创建或删除云资源
+./dist/scfproxy concurrency -f endpoints.txt -n 10 --hold 30s --target www.baidu.com:80
+# 降低同时冷启动的影响，错开每条隧道的建连时刻
+./dist/scfproxy concurrency -f endpoints.txt -n 10 --hold 60s --stagger 200ms --target www.baidu.com:80
+```
+
+concurrency 只需 `SCFPROXY_TOKEN`，不需要腾讯云凭证。默认同时建立 10 条隧道，全部拨号完成后保持 30s；`--stagger` 默认 0。保持 WS 默认每 30s ping，并从每条连接建立起每 10s 在同一 TCP 隧道发送一次明文 HTTP HEAD、读取响应头，以防目标关闭空闲连接。target 必须是支持 HTTP keep-alive 的明文 HTTP `host:port`，不要填 HTTPS 的 443 端口；目标要求关闭连接或保活读写失败会计入失败原因。HEAD 的状态码不影响实例统计，不跟随重定向。
+
+输出每条隧道的建连加握手耗时、实例 ID、握手 active 及错误，汇总不同实例数、各实例建立过的隧道数、最大 active、成功建连耗时 P50/最大值、失败数。P50 使用排序后的较低中位数；旧服务端无实例 ID 的连接单独统计，不合并成一个虚构实例。汇总基于本次握手记录，不代表整个保持阶段的实时连接数。Ctrl-C 取消并关闭连接。
+
+### 实测结果（2026-11-07，ap-guangzhou，64MB）
+
+以下为用户在真实腾讯云上的实测反馈，本轮代码修改和自动化测试未连接云服务：
+
+- 64MB 的 WS Web 函数创建成功，运行正常。
+- 未开多并发：10 条并发隧道使用 10 个实例，每个实例 1 条；建连 P50 772ms、最大 821ms，0 失败。
+- MaxConcurrency=10：10 条同时建连由 1 个实例承载，active 从 1 递增至 10，建连 P50 213ms；每 300ms 错峰建连同样只用 1 个实例，P50 184ms；15 条隧道使用 2 个实例，分布为 10+5，0 失败。
+- 同一实例 4 路并行各下载 10MB，每路约 1.3MB/s，合计约 5MB/s，0 失败。
+
+按实例时长计费时，10 条连接共享一个实例的资源费理论上约降为原来的 1/10，账单尚未核实；冷启动减少，建连更快。单连接限额（128KB/s、10 QPS）仍按连接计算，不受多并发影响。代价是一个实例异常时，其承载的连接会同时断开。
+
+仍需核对实际账单，并验证更长运行时间、更高连接数下的稳定容量及内存表现；本次结果只覆盖上述地域与规格。

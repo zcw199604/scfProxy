@@ -19,9 +19,11 @@ type Request struct {
 }
 
 type Response struct {
-	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"`
-	Error string `json:"error,omitempty"`
+	OK       bool   `json:"ok"`
+	Instance string `json:"instance,omitempty"`
+	Active   int    `json:"active,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 func NewRequest(token, target string) (Request, error) {
