@@ -1,4 +1,4 @@
-.PHONY: build-server package-server test lint
+.PHONY: build-server package-server build-cli deploy test lint
 
 build-server:
 	mkdir -p dist
@@ -16,3 +16,11 @@ test:
 lint:
 	go vet ./...
 	@test -z "$$(gofmt -l .)" || (gofmt -l .; exit 1)
+
+# deploy 仅提示手动命令，避免 make 在未确认时创建真实云资源。
+build-cli:
+	mkdir -p dist
+	go build -trimpath -o dist/scfproxy ./cmd/scfproxy
+
+deploy:
+	@echo "请先运行 make package-server 和 make build-cli，再手动执行 dist/scfproxy deploy -r <地域>；使用 -h 查看参数。"

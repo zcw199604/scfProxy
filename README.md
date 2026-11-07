@@ -1,6 +1,6 @@
 # scfproxy
 
-Go 的腾讯云 SCF WebSocket 出口隧道，第 1 阶段实现。模块为 `github.com/zcw199604/scfproxy`，要求 Go 1.23 或更新版本。运行时第三方依赖只有 `github.com/coder/websocket`；`gorilla/websocket` 仅用于兼容性测试。
+Go 的腾讯云 SCF WebSocket 出口隧道，包含核心库、云函数服务端及第 2 阶段部署管理 CLI。模块为 `github.com/zcw199604/scfproxy`，要求 Go 1.23 或更新版本。隧道运行时第三方依赖只有 `github.com/coder/websocket`，部署 CLI 另使用腾讯云 common/scf SDK；`gorilla/websocket` 仅用于兼容性测试。
 
 ## 架构
 
@@ -105,6 +105,8 @@ Token 为空时拒绝启动。普通 HTTP 请求（包括 `/healthz`）返回 `2
 {"v":1,"target":"example.com:443","ts":1700000000,"nonce":"随机16字节的小写hex","sign":"HMAC-SHA256的小写hex"}
 ```
 
+拨号先检查所有解析结果，再按 IPv4 优先、IPv6 其后的顺序直接拨 IP。每个 IP 分配 `min(剩余预算, max(剩余预算/剩余IP数, 2s))` 的超时，避免单个黑洞地址耗尽全部预算。失败回复与 slog 日志包含脱敏的 DNS 原因、已尝试 IP 及错误；禁止地址会说明解析 IP 和禁止类别，不包含 token 或签名。
+
 签名原文为 UTF-8 `v|target|ts|nonce`，版本与 Unix 秒为十进制，无末尾换行。服务端校验版本、±300 秒时差、16 字节 nonce 和 HMAC（常量时间比较），使用有到期时间、最多 65536 项的进程内缓存防重放。成功回复文本 `{"ok":true}`；失败返回 `ok:false` 及 `auth_failed`、`bad_request`、`forbidden_target` 或 `dial_failed`。然后只允许二进制消息作为 TCP 字节流，正常关闭使用 WS 1000。
 
 服务端先解析目标，**检查所有解析结果后直接拨号已检查的 IP**，拒绝混有禁用地址的 DNS 结果，避免二次解析造成 DNS rebinding。默认拒绝 unspecified、loopback、RFC1918、link-local（包括元数据地址）、100.64.0.0/10、组播、IPv6 ULA 以及相应 IPv4-mapped 地址。`AllowPrivate` 会放开这些限制，只用于本地可信测试。
@@ -118,7 +120,7 @@ make build-server   # linux/amd64、CGO_ENABLED=0、trimpath、-s -w
 make package-server # dist/scf-server.zip
 ```
 
-zip 根目录仅包含 `scf-server` 与可执行的 `scf_bootstrap`；启动脚本执行 `exec ./scf-server`。需要本机 `zip` 命令。不包含云服务创建、配置或部署命令。
+zip 根目录仅包含 `scf-server` 与可执行的 `scf_bootstrap`；启动脚本执行 `exec ./scf-server`。需要本机 `zip` 命令。云服务部署管理请使用下文的独立 CLI。
 
 所有测试仅使用动态本地端口：HTTP/HTTPS+HTTP2、SSE 分段读取、coder/gorilla WS、大于 2 MiB 的双向随机数据及实际 WS 消息长度、认证拒绝不重试、私网过滤、Bypass、失败出口冷却、预热复用/Ping/关闭、deadline、合并及 Close flush、签名与地址规则。
 
@@ -128,5 +130,116 @@ zip 根目录仅包含 `scf-server` 与可执行的 `scf_bootstrap`；启动脚�
 - 平台单消息 256 KiB、约 128 KiB/s、10 QPS 限制应结合实际套餐确认；Ping 等控制帧也可能计入平台限制，建议留出余量。下行限制可独立设置。
 - 平台空闲超时及函数最长执行时间仍可能断开连接。Ping 不能延长函数执行上限；业务方负责重连和流恢复，库不会自动重放已发送业务数据。
 - nonce 缓存仅在一个服务端进程有效，无法提供跨 SCF 实例防重放保证。保持时钟同步、使用高熵 token。
-- 未连接真实腾讯云；函数 URL 原生 WebSocket 透传、平台控制帧行为、冷启动与限额需要部署阶段实测。
-- 没有本地 HTTP/SOCKS5 监听端口、HTTP 打包转发或腾讯云部署功能。
+- 已有用户提供的广州地域实测，详见“实测结果”；其他地域、限额边界及长时间运行行为仍需验证。
+- 没有本地 HTTP/SOCKS5 监听端口或 HTTP 打包转发。
+
+## 第 2 阶段：部署和管理 CLI
+
+```bash
+make package-server
+make build-cli
+./dist/scfproxy -h
+./dist/scfproxy deploy -h
+```
+
+`make deploy` 只提示打包及手动运行步骤，不自动调用腾讯云。CLI 的部署管理代码使用按地域创建的 `SCFAPI` 接口，测试全部使用假接口；SDK 客户端构造不会发送网络请求。仅当用户手动执行对应命令时才访问云或检测目标。
+
+凭证只能通过环境变量提供，CLI 不保存凭证，也不输出 SDK 可能回显请求内容的错误消息：
+
+```bash
+export TENCENTCLOUD_SECRET_ID='你的SecretId'
+export TENCENTCLOUD_SECRET_KEY='你的SecretKey'
+# 使用临时凭证时再设置 TENCENTCLOUD_SESSION_TOKEN
+# token 只保存在当前环境，客户端和云函数必须使用同一个值
+export SCFPROXY_TOKEN="$(./dist/scfproxy gen-token)"
+```
+
+`gen-token` 输出 32 字节随机值的 64 字符 hex，不写文件。请自行通过安全渠道保存共享 token；不要把环境变量文件或 shell 历史中的真实密钥提交到仓库。腾讯云凭证只供部署管理使用，业务客户端仅需 `SCFPROXY_TOKEN` 与 endpoints 文件。
+
+部署例子（**执行会创建计费云资源**）：
+
+```bash
+./dist/scfproxy deploy -r ap-guangzhou,ap-shanghai -n 1 -o endpoints.txt
+./dist/scfproxy deploy -a foreign -n 1 --runtime CustomRuntime --yes
+# 更新已有且属于本工具的函数代码
+./dist/scfproxy deploy -r ap-guangzhou --update-code --yes
+```
+
+`-r` 显式指定地域，或 `-a domestic|foreign|all` 选择预设地域组，两者互斥。domestic 包括北京、成都、广州、上海、南京和香港；foreign 包括新加坡、曼谷、首尔、东京、法兰克福、弗吉尼亚及硅谷，all 合并二者。显式地域允许未来新增地域名，不限制为预设列表。
+
+函数名为 `<prefix>-<region>-<i>`，索引从 1 开始。默认参数为：
+
+| 参数 | 默认 / 说明 |
+| --- | --- |
+| `--prefix` | scfproxy；字母开头、字母数字或 `-`/`_`、结尾为字母数字；完整函数名 2–60 字符 |
+| `-n` | 每地域 1 个函数 |
+| `--package` | dist/scf-server.zip；检查根目录仅有两个非空可执行文件 |
+| `--runtime` | Go1；创建时可改 CustomRuntime；代码更新沿用现有 Runtime |
+| `--update-code` | false；更新已有且名称前缀、Description 均匹配的函数代码 |
+| `--timeout` | 900 秒；必须不小于 idle-timeout |
+| `--idle-timeout` | 600 秒；必须为正数，实际平台范围待确认 |
+| `--memory` | 128 MB；实际可用规格由平台校验 |
+| `--concurrency` | 8；最多同时进行的函数创建流程 |
+| `--wait-timeout` | 3 分钟；每个函数等待 Active 的总超时 |
+| `-o` | endpoints.txt；成功地址合并去重，附加地域/函数名注释，权限 0644 |
+| `--yes` | 跳过交互确认；非交互环境必须显式提供 |
+
+创建请求采用 `Namespace=default`、`Type=HTTP`、`ProtocolType=WS`、Description 为 `scfproxy` 和 `managed-by=scfproxy` 标签，关闭自动创建 CLS 主题和索引。等待状态 Active 后获取或创建 `func_url` HTTP 触发器，关闭平台 URL 认证、打开公网访问；隧道内仍必须通过 HMAC 认证。创建触发器遇到 FailedOperation 每隔 5 秒重试，最多 10 次。识别函数 URL 时不依赖 TriggerName（平台可能改写为 URL ID），选择带有效外网地址的 HTTP 触发器，多个时优先 `$LATEST`。优先读取 `WssExtranetUrl`，为空才将 `ExtranetUrl` 的 https/http 转为 wss/ws，保留路径和查询参数。
+
+默认同名函数存在时不覆盖代码、运行时、规格或 token，只读取/补建函数 URL。加 `--update-code` 时，先校验名称以 `<prefix>-` 开头且 Description 精确为 `scfproxy`，再调用 UpdateFunctionCode 更新 zip，等待 Active 后读取现有 func_url。SDK 的 UpdateFunctionCode 没有 Runtime 字段，因此沿用现有 Runtime 和 Handler；此参数不更新环境变量、token、内存或超时。需更改这些配置时请单独管理或先 delete 再 deploy。多函数部分失败会输出逐项结果并返回非零退出码，已创建的函数不会自动回滚；请用 list 核查，按需删除。endpoints 文件只保存地址及注释，不含 token。文件合并采用同目录临时文件原子替换；不支持多个 CLI 进程同时编辑同一文件。
+
+列表和删除：
+
+```bash
+./dist/scfproxy list -a all
+./dist/scfproxy delete -r ap-guangzhou --prefix scfproxy -o endpoints.txt
+# 自动化环境必须显式确认
+./dist/scfproxy delete -a foreign --yes -o endpoints.txt
+```
+
+list 分页查询并且只展示名称以 `<prefix>-` 开头、Description **精确等于** `scfproxy` 的函数，尽量读取 URL；URL 查询失败会单独提示。delete 先展示同样的清单，确认后再次核对描述，仅删除匹配资源；平台要求时先解绑触发器。成功删除后清理 endpoints 文件中的相应地址及紧邻的自动生成注释；无法获取 URL 时会提示手工核查文件。
+
+出口检测：
+
+```bash
+./dist/scfproxy check -f endpoints.txt --target https://api.ipify.org -c 4
+```
+
+每个 endpoint 使用独立单出口 Proxy，输出建连+带内握手耗时、从请求开始计的首字节耗时（含隧道/TLS）、HTTP 状态和响应正文前 100 字节。单项预算为 30 秒，失败逐项显示并最终返回非零退出码；不跟随重定向。建连时间包含冷启动影响，但也包含网络和目标 TCP 拨号，不能视为纯平台冷启动时间。
+
+下载、上传和空闲测试：
+
+```bash
+./dist/scfproxy bench -f endpoints.txt --bytes 10MB
+./dist/scfproxy bench -f endpoints.txt --bytes 10MiB --no-rate-limit
+./dist/scfproxy bench -f endpoints.txt --hold 12m --bytes 1MB
+# 本地或自有测试目标可覆盖默认URL
+./dist/scfproxy bench --download https://example.com/download --upload https://example.com/upload
+```
+
+默认下载 `https://mirrors.aliyun.com/ubuntu/ls-lR.gz`（实测约 39MB），所有下载（含 hold 后请求）最多读取 `--bytes` 指定字节数便停止并关闭响应体；目标提前结束时按实际读取量统计。没有可靠的公共上传默认目标，必须显式指定 `--upload URL`，否则跳过上传并提示。`MB` 为十进制，`MiB` 为二进制。每项单独输出实际字节数、总耗时及 B/s，包含建连及响应等待。非 2xx 状态作为警告显示，不清零已读取字节；I/O 错误仍报错并保留已读取量。上传计数为 HTTP Transport 从请求体实际读取的字节数，不代表目标应用已消费或确认的字节数。不跳过证书验证。默认每项总预算为 5 分钟加 hold 时长。
+
+`--no-rate-limit` 关闭客户端上行 QPS/字节限速，以便探测真实平台限制；服务端下行限制仍取决于打包程序配置。`--hold` 额外建立一条到 **download URL 目标**的 TCP 隧道，空闲等待指定时间后在同一隧道发 GET；HTTPS 在等待结束后才握手。空闲期间没有 TCP 业务数据，仅库的默认 30 秒 WS Ping。hold 耗时和速率包含空闲等待，不用于衡量传输峰值。如果目标自身提前关闭空闲 TCP，也会失败；此时需结合函数日志区分目标行为与平台空闲超时。keepalive 无法绕过函数最长执行时间。
+
+费用与安全：随用随删，部署及预热连接会产生实例、执行时间和流量费用；关闭自动 CLS 创建不代表关闭所有费用。函数 URL 不要公开，使用高熵 token、最小权限凭证和临时凭证；`AuthType=NONE` 表示公网可以发起 WS，HMAC 认证失败前仍可能占用实例。服务端 `-prewarm-timeout` 是**未认证连接等待首消息**的上限，默认 5 分钟；客户端池寿命默认 4 分钟且必须更短。如需调整服务端启动参数，请修改打包使用的 `deploy/scf_bootstrap` 后重新打包。
+
+### 实测结果
+
+以下为用户在真实腾讯云 `ap-guangzhou`、单个函数上的实测反馈；本轮代码修改和自动化测试未连接云服务。
+
+- `Runtime=Go1`、`Type=HTTP`、`ProtocolType=WS`、`IdleTimeOut=60`、`Timeout=900` 的 CreateFunction 一次成功；CreateTrigger（http/func_url）返回 https 地址，转换为 wss 后可直接连接。
+- 冷启动加带内握手约 200–650ms，出口 IP 为腾讯云广州地址。
+- 下行约 650KB/s–1MB/s，约 39MB 文件持续下载约 650KB/s。此结果说明所观察到的 128KB/s 限制不作用于下行，不能据此确定其他地域或套餐上限。
+- 不发送 Ping 的连接在约 60.8 秒被平台关闭，状态 1011，reason 为 `Connection idle Timeout:60`；每 30 秒发送 WS Ping 的连接存活超过 150 秒，确认 **WS Ping 会重置平台空闲计时**。
+- `mirrors.cloud.tencent.com` 等腾讯云自家域名在函数中解析为内网地址，被目标过滤正确拦截，返回 forbidden_target；请勿为访问这些镜像而放开私网过滤。
+- 国内目标及 ifconfig.me 正常；api.ipify.org / api4.ipify.org（Cloudflare）快速返回 dial_failed；httpbin.org、1.1.1.1:443 约 10 秒后 dial_failed；github.com 客户端超时。原服务端仅回复“目标连接失败”，尚不能确定具体原因。新版会返回并记录脱敏后的 DNS、逐 IP 拨号错误，便于后续判断。
+- 上行上限尚未测出：旧版 bench 遇到上传目标提前返回非 2xx 时显示 0 字节；新版保留实际请求体读取量并附加状态警告，需要重新测试。
+
+### 仍待实测
+
+- 其他地域、CustomRuntime 兼容性，IdleTimeOut 的完整范围（SDK 注释 1–1800 秒，部分资料 10–7200 秒）；当前只确认 60 秒有效。
+- Timeout 的完整范围及与 IdleTimeOut 的关系；当前只确认执行超时 900 秒、空闲超时 60 秒组合有效。
+- 上行实际速率限制、10 QPS 是否只限制上行，以及控制帧是否计入消息配额。
+- 函数最长执行时间断开、其他地域的冷启动与连接表现，以及海外目标失败的具体 DNS/网络原因。
+
+本次固定 SDK 模块为 common `v1.3.210`、scf `v1.3.101`（实现时模块代理返回的最新稳定版本）。`CreateTrigger.Response.TriggerInfo` 的 SDK 类型为 `Trigger`，`ListTriggers.Response.Triggers` 为 `TriggerInfo` 列表，分别读取其 `TriggerDesc`；其余要求的创建字段均可直接设置。

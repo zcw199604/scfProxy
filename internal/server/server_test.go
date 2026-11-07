@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -149,5 +150,72 @@ func TestDownstreamByteRate(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
 		t.Fatalf("字节限速未生效: %v", elapsed)
+	}
+}
+
+func TestHandshakeDialErrorIncludesAddressAndLog(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := ln.Addr().String()
+	ln.Close()
+	var logs bytes.Buffer
+	s, err := New(Config{Token: "secret", AllowPrivate: true, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.CloseNow()
+	req, _ := protocol.NewRequest("secret", target)
+	b, _ := json.Marshal(req)
+	if err = ws.Write(ctx, websocket.MessageText, b); err != nil {
+		t.Fatal(err)
+	}
+	_, b, err = ws.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response protocol.Response
+	if err = json.Unmarshal(b, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != "dial_failed" || !strings.Contains(response.Error, target) || !strings.Contains(response.Error, "connection refused") {
+		t.Fatalf("缺少具体拨号原因: %s", b)
+	}
+	// 等待完整关闭，确保结束日志的读取不与写入并发。
+	ws.Close(websocket.StatusNormalClosure, "")
+	s.mu.Lock()
+	for len(s.active) > 0 {
+		if ctx.Err() != nil {
+			s.mu.Unlock()
+			t.Fatal("等待连接结束超时")
+		}
+		s.mu.Unlock()
+		time.Sleep(time.Millisecond)
+		s.mu.Lock()
+	}
+	s.mu.Unlock()
+	if !strings.Contains(logs.String(), response.Error) {
+		t.Fatalf("日志没有同样诊断: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), req.Sign) || strings.Contains(response.Error, "secret") {
+		t.Fatal("认证信息泄漏")
+	}
+}
+
+func TestDiagnosticRedactsAuthenticationValues(t *testing.T) {
+	s, _ := New(Config{Token: "test-token"})
+	got := s.diagnostic("DNS test-token.example: no such host; signature=abcdef", "abcdef")
+	if strings.Contains(got, "test-token") || strings.Contains(got, "abcdef") || !strings.Contains(got, "no such host") {
+		t.Fatalf("脱敏不正确: %s", got)
 	}
 }

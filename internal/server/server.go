@@ -131,11 +131,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 	s.cfg.Logger.Info("连接建立", "remote", r.RemoteAddr)
-	var target string
+	var target, signature string
 	var up, down int64
 	var reason = "握手结束"
 	defer func() {
-		s.cfg.Logger.Info("连接结束", "target", target, "reason", reason, "up_bytes", up, "down_bytes", down)
+		s.cfg.Logger.Info("连接结束", "target", s.diagnostic(target, signature), "reason", s.diagnostic(reason, signature), "up_bytes", up, "down_bytes", down)
 	}()
 	ws.SetReadLimit(4096)
 	preCtx, preCancel := context.WithTimeout(ctx, s.cfg.PrewarmTimeout)
@@ -168,6 +168,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target = req.Target
+	signature = req.Sign
 	dialCtx, dialCancel := context.WithTimeout(ctx, s.cfg.DialTimeout)
 	tcp, err := s.dialTarget(dialCtx, target)
 	dialCancel()
@@ -179,11 +180,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errBadTarget) {
 			code = "bad_request"
 		}
-		fail(code, "目标连接失败")
+		reason = s.diagnostic(err.Error(), signature)
+		s.cfg.Logger.Warn("目标连接失败", "target", s.diagnostic(target, signature), "code", code, "error", reason)
+		fail(code, reason)
 		return
 	}
 	defer tcp.Close()
-	s.cfg.Logger.Info("目标已连接", "target", target)
+	s.cfg.Logger.Info("目标已连接", "target", s.diagnostic(target, signature))
 	if !respond(protocol.Response{OK: true}) {
 		return
 	}

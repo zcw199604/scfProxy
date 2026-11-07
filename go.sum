@@ -2,3 +2,8 @@ github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.101/go.mod h1:r5r4xbfxSaeR04b166HGsBa/R4U3SueirEUpXGuw+Q0=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.210 h1:7SckEivdgw82dO0da/fql4LqQ+CEoS3JhttCsf4Pea0=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.210/go.mod h1:r5r4xbfxSaeR04b166HGsBa/R4U3SueirEUpXGuw+Q0=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/scf v1.3.101 h1:ir6R+aI/MHFXIx6w4IZ7aPWZfrGL+KBuegniZz34JHs=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/scf v1.3.101/go.mod h1:alRtVSnlEQS/ODkOI/qhESYq+lMyz8Z1xLAVtTfnrjI=
